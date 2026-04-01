@@ -28,3 +28,13 @@ setup_registry:
   registry_user: "admin"
   registry_password: "admin"
 machineconfig_path: ../machineconfig
+setup_mirror_registry:
+  deploy: false
+  registry_url: ""
+  registry_username: ""
+  registry_password: ""
+  quay_index_image: ""
+  local_copy_dir: "/root"
+  mirror_registry_dir: "/root/mirror-registry-dir"
+  init_password: ""
+  registry_hostname: ""

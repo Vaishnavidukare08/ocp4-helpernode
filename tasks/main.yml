@@ -641,6 +641,10 @@
     - name: Setup Registry
       import_tasks: setup_registry.yaml
 
+  - name: Setup Openshift Mirror Registry
+    when: setup_mirror_registry.deploy
+    import_tasks: setup_mirror_registry.yaml
+
   - name: Enable restart always for critical services
     include_tasks: restart_config.yaml
     loop: "{{ critical_services }}"
