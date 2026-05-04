@@ -1,148 +1,447 @@
 ---
-# tasks file for configure-local-registry
+# ============================================================================
+# OpenShift Registry Setup Tasks
+# Supports both podman-based local registry and Red Hat Mirror Registry
+# ============================================================================
 
-- name: Create registry directories
-  file:
-    path: /opt/registry/{{ item }}
-    state: directory
-  with_items:
-    - auth
-    - certs
-    - data
+# ============================================================================
+# DETERMINE REGISTRY TYPE
+# ============================================================================
 
-- name: Generate an OpenSSL private key with the default values (4096 bits, RSA)
-  run_once: true
-  openssl_privatekey:
-    path: /opt/registry/certs/domain.pem
+- name: Set registry type
+  set_fact:
+    use_mirror_registry: "{{ setup_registry.use_mirror_registry | default(false) }}"
 
-- name: Generate an OpenSSL Certificate Signing Request
-  run_once: true
-  openssl_csr:
-    path: /opt/registry/certs/domain.csr
-    privatekey_path: /opt/registry/certs/domain.pem
-    basic_constraints:
-      - CA:TRUE
-    basic_constraints_critical: yes
-    common_name: "{{ registry_host }}"
+- name: Display registry type
+  debug:
+    msg: "Installing {{ 'Red Hat Mirror Registry' if use_mirror_registry else 'Podman-based Local Registry' }}"
 
-- name: Generate a Self Signed OpenSSL certificate
-  run_once: true
-  openssl_certificate:
-    path: /opt/registry/certs/domain.crt
-    privatekey_path: /opt/registry/certs/domain.pem
-    csr_path: /opt/registry/certs/domain.csr
-    provider: selfsigned
+# ============================================================================
+# RED HAT MIRROR REGISTRY INSTALLATION
+# ============================================================================
 
-- name: Create the user and password for local registry
-  run_once: true
-  shell: htpasswd -bBc /opt/registry/auth/htpasswd {{ setup_registry.registry_user | default('admin') }} {{ setup_registry.registry_password | default('admin') }}
-  args:
-    creates: /opt/registry/auth/htpasswd
-
-- name: Synchronize directories across all hosts
-  synchronize:
-    src: "{{ item }}"
-    dest: "{{ item }}"
-    recursive: yes
-  delegate_to: "{{ ansible_play_batch[0] }}"
-  with_items:
-    - /opt/registry/
-    - ~/.openshift/
-  when: high_availability is defined
-
-- name: Copy Self Signed OpenSSL certificate
-  copy:
-    src: /opt/registry/certs/domain.crt
-    dest: /etc/pki/ca-trust/source/anchors/domain.crt
-    remote_src: yes
-    force: yes
-
-- name: Add the Self Signed OpenSSL certificate to your list of trusted certificates
-  shell: |
-    update-ca-trust || true
-    cat /etc/pki/tls/certs/ca-bundle.trust.crt | grep {{ registry_host }} | wc -l
-  register: cert_trust
-  until: cert_trust.stdout|int == 1
-  retries: 3
-  delay: 10
-
-- name: Generate local-registry service file
-  template:
-    src: ../templates/local-registry.service.j2
-    dest: /etc/systemd/system/local-registry.service
-    mode: 0655
-
-- name: Start local-registry
-  systemd:
-    name: local-registry
-    state: started
-    enabled: yes
-    daemon_reload: yes
-
-- name: Ensure registry pod is up
-  shell: podman ps | grep local-registry
-  register: pod_state
-  until: pod_state.stdout != ""
-  retries: 4
-  delay: 15
-
-- name: Allow traffic at local registry port
-  firewalld:
-    port: 5000/tcp
-    permanent: yes
-    zone: "{{ item }}"
-    state: enabled
-  with_items:
-  - internal
-  - public
-
-- name: Restarting regitry services
-  service:
-    name: "{{ item }}"
-    state: restarted
-  with_items:
-    - "{{ registry_services }}"
-
-- name: Get local registry pod
-  shell: curl -u {{ setup_registry.registry_user | default('admin') }}:{{ setup_registry.registry_password | default('admin') }} -k https://{{ local_registry }}/v2/_catalog | grep repositories
-  register: pod_state
-  until: pod_state.stdout != ""
-  retries: 3
-  delay: 30
-
-- name: Mirror the registry
-  when: pod_state.stdout != ""
+- name: Install Red Hat Mirror Registry
+  when: use_mirror_registry | bool
   block:
-  - name: Generate the base64-encoded user name and password or token for your mirror registry
-    shell: |
-      registry_token=`echo -n "{{ setup_registry.registry_user  | default('admin') }}:{{ setup_registry.registry_password | default('admin') }}" | base64 -w0`
-      jq '.auths += {"{{ local_registry }}": {"auth": "'$registry_token'","email": "noemail@localhost"}}' < ~/.openshift/pull-secret > ~/.openshift/pull-secret-updated
-    args:
-      creates: ~/.openshift/pull-secret-updated
+    - name: Login to podman
+      command: >
+         podman login {{ registry_url}} -u {{ registry_username }} --password-stdin
+      args:
+        stdin: "{{registry_password}}"
+      register: podman_login
+      no_log: true
+      changed_when: "'Login Succeeded!' in podman_login.stdout"
+      failed_when: "'Login Succeeded!' not in podman_login.stdout"
 
-  - name: Mirror the registry
-    when: setup_registry.autosync_registry
-    shell: oc adm -a ~/.openshift/pull-secret-updated release mirror \
-      --from={{ release_image }} \
-      --to={{ local_registry }}/{{ setup_registry.local_repo }} \
-      --to-release-image={{ local_registry }}/{{ setup_registry.local_repo }}:{{ setup_registry.release_tag }}
-    register: registry
+    - name: Login failure
+      fail:
+        msg: "Invalid credentials for {{ registry_url }}"
+      when: "'Login Succeeded!' not in podman_login.stdout"
 
-  - name: Generate Local Registry information
-    when: setup_registry.autosync_registry
-    copy:
-      content: "{{ registry.stdout }}"
-      dest: ../postrun-local-registry-info
+    - name: Check if mirror registry is already installed
+      stat:
+        path: "{{ mirror_registry_dir }}/mirror-registry"
+      register: mirror_registry_exists
 
-  - name: Process Local Registry information
-    when: setup_registry.autosync_registry
-    shell: "sed -i '1,/Success/d' ../postrun-local-registry-info"
+    - name: Get current mirror registry status
+      shell: "{{ mirror_registry_dir }}/mirror-registry status 2>/dev/null || echo 'not_installed'"
+      register: mirror_registry_status
+      changed_when: false
+      failed_when: false
+      when: mirror_registry_exists.stat.exists
 
-  - name: Mirror NFS image (x86_64)
-    when: setup_registry.autosync_registry and not ppc64le
-    shell: |
-      oc image mirror quay.io/external_storage/nfs-client-provisioner:latest registry.{{ dns.clusterid }}.{{ dns.domain }}:5000/nfs-client-provisioner:latest -a ~/.openshift/pull-secret-updated
+    - name: Uninstall existing mirror registry if reinstalling
+      shell: |
+        if [ -x "{{ mirror_registry_dir }}/mirror-registry" ]; then
+          "{{ mirror_registry_dir }}/mirror-registry" uninstall --autoApprove
+        fi
+      become: yes
+      register: uninstall_result
+      failed_when: false
+      changed_when: uninstall_result.rc == 0
+      when:
+        - mirror_registry_exists.stat.exists
+        - force_reinstall | default(false)
 
-  - name: Mirror NFS image (ppc64le)
-    when: setup_registry.autosync_registry and ppc64le
-    shell: "oc image mirror docker.io/ibmcom/nfs-client-provisioner-ppc64le:latest registry.{{ dns.clusterid }}.{{ dns.domain }}:5000/nfs-client-provisioner-ppc64le:latest -a ~/.openshift/pull-secret-updated"
+    - name: Pull mirror registry image
+      shell: podman pull {{ quay_index_image }}
+      register: podman_pull
+      changed_when: "'Downloaded newer image' in podman_pull.stdout or 'Pulling' in podman_pull.stdout"
+      retries: 3
+      delay: 10
+      until: podman_pull.rc == 0
+
+    - name: Create mirror registry directory
+      file:
+        path: "{{ mirror_registry_dir }}"
+        state: directory
+        mode: '0755'
+      become: yes
+
+    - name: Copy mirror registry from container
+      shell: |
+        container_id=$(podman create {{ quay_index_image }})
+        podman cp $container_id:/mirror-registry.tar.gz {{ local_copy_dir }}/mirror-registry.tar.gz
+        podman rm $container_id
+      args:
+        creates: "{{ local_copy_dir }}/mirror-registry.tar.gz"
+
+    - name: Extract the mirror registry
+      become: yes
+      unarchive:
+        src: "{{ local_copy_dir }}/mirror-registry.tar.gz"
+        dest: "{{ mirror_registry_dir }}"
+        remote_src: yes
+        creates: "{{ mirror_registry_dir }}/mirror-registry"
+
+    - name: Make mirror-registry binary executable
+      file:
+        path: "{{ mirror_registry_dir }}/mirror-registry"
+        mode: '0755'
+      become: yes
+
+    - name: Install mirror registry
+      shell: |
+        "{{ mirror_registry_dir }}/mirror-registry" install \
+        --initPassword="{{ init_password }}" \
+        --quayHostname="{{ registry_hostname }}"
+      register: install_result
+      become: yes
+      when: not mirror_registry_exists.stat.exists or force_reinstall | default(false)
+
+    - name: Wait for mirror registry to be operational
+      uri:
+        url: "https://{{ registry_hostname }}:8443/health/instance"
+        method: GET
+        validate_certs: no
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: 10
+      delay: 15
+
+    - name: Configure firewall for mirror registry
+      firewalld:
+        port: "{{ item }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - 8443
+        - 8080
+
+    - name: Display mirror registry completion
+      debug:
+        msg:
+          - "Red Hat Mirror Registry installed successfully"
+          - "URL: https://{{ registry_hostname }}:8443"
+          - "Username: init"
+          - "password: {{ init_password }}"
+
+# ============================================================================
+# PODMAN-BASED LOCAL REGISTRY INSTALLATION
+# ============================================================================
+
+- name: Install Podman-based Local Registry
+  when: not use_mirror_registry | bool
+  block:
+    - name: Create registry directories
+      file:
+        path: /opt/registry/{{ item }}
+        state: directory
+        mode: '0755'
+      loop:
+        - auth
+        - certs
+        - data
+
+    - name: Generate an OpenSSL private key
+      run_once: true
+      openssl_privatekey:
+        path: /opt/registry/certs/domain.pem
+        size: 4096
+
+    - name: Generate an OpenSSL Certificate Signing Request
+      run_once: true
+      openssl_csr:
+        path: /opt/registry/certs/domain.csr
+        privatekey_path: /opt/registry/certs/domain.pem
+        basic_constraints:
+          - CA:TRUE
+        basic_constraints_critical: yes
+        common_name: "{{ registry_host }}"
+        subject_alt_name:
+          - "DNS:{{ registry_host }}"
+          - "DNS:registry.{{ dns.clusterid }}.{{ dns.domain | default(registry_host) }}"
+          - "IP:{{ ansible_default_ipv4.address }}"
+
+    - name: Generate a Self Signed OpenSSL certificate
+      run_once: true
+      openssl_certificate:
+        path: /opt/registry/certs/domain.crt
+        privatekey_path: /opt/registry/certs/domain.pem
+        csr_path: /opt/registry/certs/domain.csr
+        provider: selfsigned
+
+    - name: Create the user and password for local registry
+      run_once: true
+      shell: htpasswd -bBc /opt/registry/auth/htpasswd {{ setup_registry.registry_user | default('admin') }} {{ setup_registry.registry_password | default('admin') }}
+      args:
+        creates: /opt/registry/auth/htpasswd
+      no_log: true
+
+    - name: Synchronize directories across all hosts
+      synchronize:
+        src: "{{ item }}"
+        dest: "{{ item }}"
+        recursive: yes
+      delegate_to: "{{ ansible_play_batch[0] }}"
+      loop:
+        - /opt/registry/
+        - ~/.openshift/
+      when:
+        - high_availability is defined
+        - high_availability | bool
+        - inventory_hostname != ansible_play_batch[0]
+
+    - name: Copy Self Signed OpenSSL certificate
+      copy:
+        src: /opt/registry/certs/domain.crt
+        dest: /etc/pki/ca-trust/source/anchors/domain.crt
+        remote_src: yes
+        force: yes
+
+    - name: Add the Self Signed OpenSSL certificate to trusted certificates
+      shell: |
+        update-ca-trust
+        sleep 2
+        cat /etc/pki/tls/certs/ca-bundle.trust.crt | grep -c "{{ registry_host }}" || echo "0"
+      register: cert_trust
+      until: cert_trust.stdout|int >= 1
+      retries: 3
+      delay: 10
+      changed_when: false
+
+    - name: Generate local-registry service file
+      template:
+        src: ../templates/local-registry.service.j2
+        dest: /etc/systemd/system/local-registry.service
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Start local-registry
+      systemd:
+        name: local-registry
+        state: started
+        enabled: yes
+
+    - name: Ensure registry pod is up
+      shell: podman ps --filter "name=local-registry" --format "{{{{.Names}}}}"
+      register: pod_state
+      until: "'local-registry' in pod_state.stdout"
+      retries: 6
+      delay: 10
+      changed_when: false
+
+    - name: Allow traffic at local registry port
+      firewalld:
+        port: 5000/tcp
+        permanent: yes
+        zone: "{{ item }}"
+        state: enabled
+        immediate: yes
+      loop:
+        - internal
+        - public
+
+    - name: Restarting registry services
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop: "{{ registry_services }}"
+      when: registry_services is defined
+
+    - name: Get local registry pod
+      shell: curl -u {{ setup_registry.registry_user | default('admin') }}:{{ setup_registry.registry_password | default('admin') }} -k https://{{ local_registry }}/v2/_catalog
+      register: pod_state
+      until: "'repositories' in pod_state.stdout"
+      retries: 5
+      delay: 15
+      changed_when: false
+      no_log: true
+
+    - name: Display local registry completion
+      debug:
+        msg:
+          - "Podman-based Local Registry installed successfully"
+          - "URL: https://{{ local_registry }}"
+          - "Username: {{ setup_registry.registry_user | default('admin') }}"
+
+# ============================================================================
+# COMMON: PULL SECRET CONFIGURATION
+# ============================================================================
+
+- name: Configure pull secret
+  block:
+    - name: Ensure .openshift directory exists
+      file:
+        path: ~/.openshift
+        state: directory
+        mode: '0700'
+
+    - name: Check if pull-secret exists
+      stat:
+        path: ~/.openshift/pull-secret
+      register: pull_secret_stat
+
+    - name: Generate registry credentials in base64
+      shell: |
+        {% if use_mirror_registry | bool %}
+        echo -n "init:{{ init_password }}" | base64 -w0
+        {% else %}
+        echo -n "{{ setup_registry.registry_user | default('admin') }}:{{ setup_registry.registry_password | default('admin') }}" | base64 -w0
+        {% endif %}
+      register: registry_token
+      changed_when: false
+      no_log: true
+
+    - name: Set registry URL for pull secret
+      set_fact:
+        registry_url_for_secret: "{{ registry_hostname + ':8443' if use_mirror_registry | bool else local_registry }}"
+
+    - name: Update pull secret with registry credentials
+      shell: |
+        if [ -f ~/.openshift/pull-secret ]; then
+          jq '.auths += {"{{ registry_url_for_secret }}": {"auth": "{{ registry_token.stdout }}","email": "noemail@localhost"}}' \
+          < ~/.openshift/pull-secret > ~/.openshift/pull-secret-updated
+        else
+          echo '{"auths":{"{{ registry_url_for_secret }}":{"auth":"{{ registry_token.stdout }}","email":"noemail@localhost"}}}' \
+          > ~/.openshift/pull-secret-updated
+        fi
+      args:
+        creates: ~/.openshift/pull-secret-updated
+      no_log: true
+
+    - name: Backup original pull secret
+      copy:
+        src: ~/.openshift/pull-secret
+        dest: ~/.openshift/pull-secret.backup
+        remote_src: yes
+        force: no
+      when: pull_secret_stat.stat.exists
+
+# ============================================================================
+# COMMON: MIRROR OPENSHIFT RELEASE
+# ============================================================================
+
+- name: Mirror OpenShift release
+  when:
+    - setup_registry.autosync_registry is defined
+    - setup_registry.autosync_registry | bool
+    - release_image is defined
+  block:
+    - name: Display mirroring information
+      debug:
+        msg:
+          - "Starting OpenShift release mirroring"
+          - "From: {{ release_image }}"
+          - "To: {{ registry_url_for_secret }}/{{ setup_registry.local_repo }}"
+
+    - name: Mirror the registry
+      shell: |
+        oc adm -a ~/.openshift/pull-secret-updated release mirror \
+          --from={{ release_image }} \
+          --to={{ registry_url_for_secret }}/{{ setup_registry.local_repo }} \
+          --to-release-image={{ registry_url_for_secret }}/{{ setup_registry.local_repo }}:{{ setup_registry.release_tag }} \
+          {% if use_mirror_registry | bool %}--insecure=true{% endif %}
+      register: registry_mirror
+      async: 7200
+      poll: 30
+
+    - name: Generate Local Registry information
+      copy:
+        content: "{{ registry_mirror.stdout }}"
+        dest: ../postrun-local-registry-info
+        mode: '0644'
+      when: registry_mirror.stdout is defined
+
+    - name: Process Local Registry information
+      shell: "sed -i '1,/Success/d' ../postrun-local-registry-info"
+      when: registry_mirror.stdout is defined
+
+    - name: Mirror NFS image (x86_64)
+      when:
+        - not ppc64le
+      shell: |
+        oc image mirror quay.io/external_storage/nfs-client-provisioner:latest {{ registry_url_for_secret }}/nfs-client-provisioner:latest -a ~/.openshift/pull-secret-updated {% if use_mirror_registry | bool %}--insecure=true{% endif %}
+      register: nfs_mirror_x86
+      failed_when: false
+
+    - name: Mirror NFS image (ppc64le)
+      when:
+        - ppc64le
+      shell: |
+        oc image mirror docker.io/ibmcom/nfs-client-provisioner-ppc64le:latest {{ registry_url_for_secret }}/nfs-client-provisioner-ppc64le:latest -a ~/.openshift/pull-secret-updated {% if use_mirror_registry | bool %}--insecure=true{% endif %}
+      register: nfs_mirror_ppc
+      failed_when: false
+
+# ============================================================================
+# POST-INSTALLATION INFORMATION
+# ============================================================================
+
+- name: Create registry information file
+  copy:
+    content: |
+      # Registry Installation Information
+
+      ## Registry Type
+      {{ 'Red Hat Mirror Registry (OMR)' if use_mirror_registry | bool else 'Podman-based Local Registry' }}
+
+      ## Access Details
+      - Registry URL: {{ 'https://' + registry_hostname + ':8443' if use_mirror_registry | bool else 'https://' + local_registry }}
+      - Username: {{ 'init' if use_mirror_registry | bool else setup_registry.registry_user | default('admin') }}
+      - Pull Secret: ~/.openshift/pull-secret-updated
+
+      ## Management Commands
+      {% if use_mirror_registry | bool %}
+      ```bash
+      # Mirror Registry Commands
+      {{ mirror_registry_dir }}/mirror-registry status
+      {{ mirror_registry_dir }}/mirror-registry stop
+      {{ mirror_registry_dir }}/mirror-registry start
+      {{ mirror_registry_dir }}/mirror-registry restart
+
+      # View logs
+      podman logs quay-app
+      podman logs quay-postgres
+      ```
+      {% else %}
+      ```bash
+      # Local Registry Commands
+      systemctl status local-registry
+      systemctl restart local-registry
+      podman logs local-registry
+      ```
+      {% endif %}
+
+      ## Using with OpenShift
+      ```yaml
+      pullSecret: '$(cat ~/.openshift/pull-secret-updated | jq -c .)'
+      ```
+    dest: ../REGISTRY-INFO.md
+    mode: '0644'
+
+- name: Display setup completion message
+  debug:
+    msg:
+      - "============================================"
+      - "Registry Setup Complete!"
+      - "============================================"
+      - "Type: {{ 'Red Hat Mirror Registry' if use_mirror_registry | bool else 'Podman Local Registry' }}"
+      - "URL: {{ 'https://' + registry_hostname + ':8443' if use_mirror_registry | bool else 'https://' + local_registry }}"
+      - "Pull Secret: ~/.openshift/pull-secret-updated"
+      - "Documentation: ../REGISTRY-INFO.md"
+      - "============================================"
